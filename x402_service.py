@@ -20,7 +20,7 @@ mw = payment_middleware_from_config(
         "price": PRICE, "maxAmountRequired": PRICE_BASE_UNITS}]}},
     facilitator_client=fac,
     schemes=[{"network": NETWORK, "server": ExactEvmServerScheme()}],
-    sync_facilitator_on_start=False,
+    sync_facilitator_on_start=True,
 )
 
 app = FastAPI(title="kcaldata paid (x402)", version="0.1.0")
