@@ -1,10 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from fastmcp import FastMCP
-import sqlite3, re
+import sqlite3, re, os, json, datetime
 
 DB_FILE = "kcaldata.db"
+FREE_DAILY_LIMIT = 100
+USAGE = {}  # (identifier, date) -> count. In-memory; resets on restart (see notes).
 
 WEIGHT_UNITS = {
     "g": 1, "gram": 1, "grams": 1, "kg": 1000, "kilogram": 1000, "kilograms": 1000,
@@ -198,6 +200,52 @@ def do_lookup(query):
     ]
     con.close(); return result
 
+# ---------- API keys + daily rate limiting ----------
+def load_keys():
+    raw = os.environ.get("API_KEYS", "").strip()
+    if not raw:
+        return {}
+    try:
+        return {str(k): int(v) for k, v in json.loads(raw).items()}
+    except Exception:
+        return {}
+
+def client_ip(request):
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def rate_check(request, api_key):
+    today = datetime.date.today().isoformat()
+    if len(USAGE) > 5000:
+        for k in [k for k in USAGE if k[1] != today]:
+            USAGE.pop(k, None)
+    keys = load_keys()
+    if api_key:
+        if api_key not in keys:
+            return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+        identifier = "key:" + api_key; limit = keys[api_key]; tier = "keyed"
+    else:
+        identifier = "ip:" + client_ip(request); limit = FREE_DAILY_LIMIT; tier = "free"
+    k = (identifier, today)
+    used = USAGE.get(k, 0)
+    if used >= limit:
+        return JSONResponse(status_code=429, content={
+            "error": "Daily request limit reached",
+            "tier": tier, "limit": limit,
+            "message": f"Free tier is capped at {FREE_DAILY_LIMIT} requests/day. "
+                       "For a higher limit, get an API key (paid in USDC).",
+        })
+    USAGE[k] = used + 1
+    return limit, limit - USAGE[k]
+
+def with_limits(payload, limit, remaining, status=200):
+    resp = JSONResponse(content=payload, status_code=status)
+    resp.headers["X-RateLimit-Limit"] = str(limit)
+    resp.headers["X-RateLimit-Remaining"] = str(remaining)
+    return resp
+
 # ---------- MCP server (Streamable HTTP), shares do_lookup ----------
 mcp = FastMCP("kcaldata")
 
@@ -215,25 +263,38 @@ def lookup_calories(query: str) -> dict:
 
 mcp_app = mcp.http_app(path="/mcp", allowed_hosts=["*"], allowed_origins=["*"])
 
-# ---------- REST API, sharing the MCP app's lifespan ----------
-app = FastAPI(title="kcaldata API", version="0.8.0", lifespan=mcp_app.lifespan)
+# ---------- REST API ----------
+app = FastAPI(title="kcaldata API", version="0.9.0", lifespan=mcp_app.lifespan)
 
 @app.get("/")
 def home():
     return {"name": "kcaldata API", "rest": "/v1/lookup?query=banana",
-            "mcp": "/mcp-server/mcp", "docs": "/docs"}
+            "mcp": "/mcp-server/mcp", "docs": "/docs",
+            "free_tier": f"{FREE_DAILY_LIMIT} requests/day"}
 
 @app.get("/v1/lookup")
-def lookup(query: str):
+def lookup(query: str, request: Request, api_key: str | None = None):
+    rc = rate_check(request, request.headers.get("x-api-key") or api_key)
+    if isinstance(rc, JSONResponse):
+        return rc
+    limit, remaining = rc
     r = do_lookup(query)
-    return r if r else JSONResponse(status_code=404, content={"error": f"No match for '{query}'"})
+    if not r:
+        return with_limits({"error": f"No match for '{query}'"}, limit, remaining, status=404)
+    return with_limits(r, limit, remaining)
 
 class Query(BaseModel):
     query: str
 
 @app.post("/v1/lookup")
-def lookup_post(body: Query):
+def lookup_post(body: Query, request: Request, api_key: str | None = None):
+    rc = rate_check(request, request.headers.get("x-api-key") or api_key)
+    if isinstance(rc, JSONResponse):
+        return rc
+    limit, remaining = rc
     r = do_lookup(body.query)
-    return r if r else JSONResponse(status_code=404, content={"error": f"No match for '{body.query}'"})
+    if not r:
+        return with_limits({"error": f"No match for '{body.query}'"}, limit, remaining, status=404)
+    return with_limits(r, limit, remaining)
 
 app.mount("/mcp-server", mcp_app)
