@@ -4,20 +4,24 @@ from pydantic import BaseModel
 import sqlite3, re
 
 DB_FILE = "kcaldata.db"
-app = FastAPI(title="kcaldata API", version="0.2.0")
+app = FastAPI(title="kcaldata API", version="0.3.0")
 
 WEIGHT_UNITS = {
-    "g": 1, "gram": 1, "grams": 1,
-    "kg": 1000, "kilogram": 1000, "kilograms": 1000,
+    "g": 1, "gram": 1, "grams": 1, "kg": 1000, "kilogram": 1000, "kilograms": 1000,
     "oz": 28.3495, "ounce": 28.3495, "ounces": 28.3495,
     "lb": 453.592, "lbs": 453.592, "pound": 453.592, "pounds": 453.592,
+}
+SIZE_WORDS = {"large", "small", "medium", "extra", "jumbo", "mini", "xl"}
+PORTION_UNITS = {
+    "cup", "slice", "clove", "piece", "stick", "fillet", "serving", "can",
+    "tbsp", "tablespoon", "tsp", "teaspoon", "bottle", "bar", "patty", "link",
 }
 
 def fmt(n):
     return int(n) if float(n).is_integer() else round(n, 2)
 
-def score(query, desc):
-    q = query.lower().strip(); d = desc.lower(); s = 0.0
+def score(term, desc):
+    q = term.lower().strip(); d = desc.lower(); s = 0.0
     if d == q: s += 100
     if re.search(r"\b" + re.escape(q) + r"\b", d): s += 50
     idx = d.find(q)
@@ -25,44 +29,63 @@ def score(query, desc):
     s -= len(d) * 0.15
     return s
 
+def best_score(terms, desc):
+    opts = [terms]
+    if terms.endswith("s"): opts.append(terms[:-1])
+    return max(score(o, desc) for o in opts)
+
+def search_rows(cur, term):
+    cur.execute("SELECT f.fdc_id, f.description, c.kcal_per_100g "
+                "FROM foods f JOIN calories c ON f.fdc_id=c.fdc_id "
+                "WHERE f.description LIKE ?", (f"%{term}%",))
+    return cur.fetchall()
+
 def best_food(cur, terms):
-    terms = terms.strip()
+    terms = terms.strip().lower()
     if not terms: return None
-    variants = [terms]
-    if terms.endswith("s"): variants.append(terms[:-1])
-    rows = []
+    variants = [terms] + ([terms[:-1]] if terms.endswith("s") else [])
+    seen = {}
     for v in variants:
-        cur.execute("SELECT f.fdc_id, f.description, c.kcal_per_100g "
-                    "FROM foods f JOIN calories c ON f.fdc_id=c.fdc_id "
-                    "WHERE f.description LIKE ?", (f"%{v}%",))
-        rows = cur.fetchall()
-        if rows: break
-    if not rows:
+        for r in search_rows(cur, v):
+            seen[r["fdc_id"]] = r
+    if not seen:
         for w in sorted(terms.split(), key=len, reverse=True):
-            w2 = w[:-1] if w.endswith("s") else w
-            cur.execute("SELECT f.fdc_id, f.description, c.kcal_per_100g "
-                        "FROM foods f JOIN calories c ON f.fdc_id=c.fdc_id "
-                        "WHERE f.description LIKE ?", (f"%{w2}%",))
-            rows = cur.fetchall()
-            if rows: break
-    if not rows: return None
-    rows.sort(key=lambda r: score(terms, r["description"]), reverse=True)
+            wv = w[:-1] if w.endswith("s") else w
+            if len(wv) < 3: continue
+            for r in search_rows(cur, wv):
+                seen[r["fdc_id"]] = r
+            if seen: break
+    if not seen: return None
+    rows = list(seen.values())
+    rows.sort(key=lambda r: best_score(terms, r["description"]), reverse=True)
     return rows
 
-def find_portion(cur, fdc_id, word):
+def mod_words(mod):
+    return {w.rstrip("s") for w in re.split(r"[\s,]+", (mod or "").lower().strip()) if w}
+
+def find_portion(cur, fdc_id, candidates):
     cur.execute("SELECT amount, modifier, gram_weight FROM portions "
                 "WHERE fdc_id=? AND gram_weight>0", (fdc_id,))
-    w = word.lower().rstrip("s")
-    partial = None
-    for amount, modifier, gram_weight in cur.fetchall():
-        mod = (modifier or "").lower().strip()
-        per = gram_weight / amount if amount else gram_weight
-        label = f"1 {modifier} \u2248 {round(per)} g"
-        if mod == w:
-            return per, label
-        if partial is None and w and w in mod.split():
-            partial = (per, label)
-    return partial
+    portions = cur.fetchall()
+    cand = {c.lower().rstrip("s") for c in candidates if c}
+    def out(amount, modifier, gw, assumed=False):
+        per = gw / amount if amount else gw
+        m = (modifier or "").strip()
+        label = f"1 {m} \u2248 {round(per)} g" if m else f"1 unit \u2248 {round(per)} g"
+        return per, label, assumed
+    for amount, modifier, gw in portions:          # exact word match
+        if cand & mod_words(modifier):
+            return out(amount, modifier, gw)
+    if cand:                                        # substring fallback
+        for amount, modifier, gw in portions:
+            if any(c in (modifier or "").lower() for c in cand):
+                return out(amount, modifier, gw)
+        return None
+    for pref in ("medium", "large", "small"):       # no unit given: assume a size
+        for amount, modifier, gw in portions:
+            if pref in mod_words(modifier):
+                return out(amount, modifier, gw, assumed=True)
+    return None
 
 def parse(query):
     m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(.*)$", query.strip())
@@ -74,41 +97,52 @@ def do_lookup(query):
     con = sqlite3.connect(DB_FILE); con.row_factory = sqlite3.Row
     cur = con.cursor()
     qty, rest = parse(query)
-    grams = None; unit = None; basis = None; food_terms = rest; rows = None
+    grams = unit = basis = None; assumed = False; rows = None; food_terms = rest
 
     if qty is not None and rest:
-        first, _, remainder = rest.partition(" ")
-        fw = first.lower().rstrip(".")
-        if fw in WEIGHT_UNITS and remainder:
-            grams = qty * WEIGHT_UNITS[fw]; unit = first; food_terms = remainder
+        tokens = rest.split()
+        fw = tokens[0].lower().rstrip(".")
+        if fw in WEIGHT_UNITS and len(tokens) > 1:
+            grams = qty * WEIGHT_UNITS[fw]; unit = tokens[0]
+            food_terms = " ".join(tokens[1:])
             basis = f"{fmt(qty)} {unit} = {round(grams)} g"
-        elif remainder:
-            cand = best_food(cur, remainder)
-            if cand:
-                p = find_portion(cur, cand[0]["fdc_id"], first)
+            rows = best_food(cur, food_terms)
+        else:
+            descriptors = [t for t in tokens if t.lower() in SIZE_WORDS]
+            units = [t for t in tokens if t.lower().rstrip("s") in PORTION_UNITS]
+            stripped = " ".join(t for t in tokens
+                                if t.lower() not in SIZE_WORDS
+                                and t.lower().rstrip("s") not in PORTION_UNITS)
+            food_terms = stripped.strip() or rest
+            rows = best_food(cur, food_terms)
+            if rows:
+                p = find_portion(cur, rows[0]["fdc_id"], units + descriptors)
                 if p:
-                    per, label = p
-                    grams = qty * per; unit = first; food_terms = remainder
-                    rows = cand
+                    per, label, assumed = p
+                    grams = qty * per
+                    unit = (descriptors + units + ["unit"])[0]
                     basis = f"{fmt(qty)} \u00d7 ({label})"
 
-    rows = rows or best_food(cur, food_terms)
+    if rows is None:
+        rows = best_food(cur, food_terms)
     if not rows:
         con.close(); return None
+
     best = rows[0]; kcal100 = best["kcal_per_100g"]
     result = {
         "query": query,
         "matched_food": best["description"],
         "calories_kcal_per_100g": round(kcal100),
-        "confidence": round(max(0.3, min(0.99, score(food_terms, best["description"]) / 100)), 2),
+        "confidence": round(max(0.3, min(0.99, best_score(food_terms, best["description"]) / 100)), 2),
         "source": "USDA FoodData Central (SR Legacy)",
     }
     if grams is not None:
-        result["quantity"] = fmt(qty)
-        result["unit"] = unit
+        result["quantity"] = fmt(qty); result["unit"] = unit
         result["grams_used"] = round(grams, 1)
         result["calories_kcal"] = round(kcal100 * grams / 100)
         result["basis"] = basis
+        if assumed:
+            result["note"] = "No size given; assumed a medium/standard portion."
     elif qty is not None:
         result["note"] = "Couldn't resolve the unit; showing calories per 100 g."
     result["alternatives"] = [
