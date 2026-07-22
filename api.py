@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import sqlite3, re
 
 DB_FILE = "kcaldata.db"
-app = FastAPI(title="kcaldata API", version="0.6.0")
+app = FastAPI(title="kcaldata API", version="0.7.0")
 
 WEIGHT_UNITS = {
     "g": 1, "gram": 1, "grams": 1, "kg": 1000, "kilogram": 1000, "kilograms": 1000,
@@ -16,66 +16,58 @@ PORTION_UNITS = {
     "cup", "slice", "clove", "piece", "stick", "fillet", "serving", "can",
     "tbsp", "tablespoon", "tsp", "teaspoon", "bottle", "bar", "patty", "link",
 }
-# Processing/product words. Penalized only when the user did NOT ask for them.
+# Processing / product words, stored SINGULAR. Penalized only if NOT requested.
 PROCESSED = {
     "dried", "dehydrated", "powder", "powdered", "mix", "imitation", "substitute",
-    "concentrate", "breaded", "frozen", "nuggets", "microwaved", "heated", "smoked",
+    "concentrate", "breaded", "frozen", "nugget", "microwaved", "heated", "smoked",
     "canned", "prepared", "juice", "drink", "beverage", "flavored", "flavor",
-    "snacks", "snack", "bread", "cake", "pie", "candy", "cereal", "bar", "bars",
-    "sauce", "soup", "yogurt", "yoghurt", "chips", "pudding", "spread", "syrup",
-    "baby", "infant", "dressing", "gravy", "filling",
+    "snack", "cake", "pie", "candy", "cereal", "sauce", "soup", "yogurt",
+    "yoghurt", "chip", "pudding", "spread", "syrup", "baby", "babyfood",
+    "infant", "dressing", "gravy", "filling", "strudel", "croissant", "strained",
 }
-CAPS_IGNORE = {"USDA", "FDA", "II", "III"}
-# Curated truths for foods USDA files under a category (strong nudge):
 CANONICAL_BOOST = {
     "bacon": ["pork", "cured"],
     "milk": ["whole"],
     "chicken": ["broiler", "meat only"],
+    "salmon": ["fish"],
 }
 
 def fmt(n):
     return int(n) if float(n).is_integer() else round(n, 2)
 
-def norm(w):
+def singular(w):
     w = w.lower()
     return w[:-1] if len(w) > 3 and w.endswith("s") else w
 
+def norm_str(s):
+    return " ".join(singular(w) for w in re.findall(r"[a-z]+", s.lower()))
+
 def raw_score(term, desc):
-    q = term.lower().strip(); d = desc.lower(); s = 0.0
-    if d == q: s += 100
-    if re.search(r"\b" + re.escape(q) + r"\b", d): s += 50
-    idx = d.find(q)
+    nq = norm_str(term); nd = norm_str(desc); s = 0.0
+    if nd == nq: s += 100
+    if nq and re.search(r"\b" + re.escape(nq) + r"\b", nd): s += 50
+    idx = nd.find(nq) if nq else -1
     if idx >= 0: s += max(0, 30 - idx)
-    s -= len(d) * 0.15
+    s -= len(nd) * 0.15
     return s
 
 def adjust(terms, desc):
-    qwords = {norm(w) for w in re.findall(r"[a-z]+", terms.lower())}
-    orig = re.findall(r"[A-Za-z]+", desc)
-    dwords = [t.lower() for t in orig]
-    dnorm = {norm(w) for w in dwords}
+    qwords = {singular(w) for w in re.findall(r"[a-z]+", terms.lower())}
+    dset = {singular(w) for w in re.findall(r"[a-z]+", desc.lower())}
     b = 0.0
-    # Leading ALL-CAPS token usually means a brand (e.g., "SILK"): push down.
-    if orig and orig[0].isupper() and len(orig[0]) >= 2 and orig[0] not in CAPS_IGNORE:
-        b -= 40
-    # Head-noun: the queried food is the 1st (best) or 2nd word of the name.
-    if dwords:
-        if norm(dwords[0]) in qwords: b += 45
-        elif len(dwords) > 1 and norm(dwords[1]) in qwords: b += 30
-    if "raw" in dwords: b += 12
-    # Penalize processing/product words the user did NOT ask for.
-    b -= 16 * len({w for w in dnorm if w in PROCESSED} - qwords)
+    if "raw" in dset: b += 14
+    if "unprepared" in dset: b += 8
+    b -= 16 * len({w for w in dset if w in PROCESSED} - qwords)
     if "egg" in qwords:
-        if "whole" in dnorm: b += 6
-        if "yolk" in dnorm and "yolk" not in qwords: b -= 12
+        if "whole" in dset: b += 8
+        if "yolk" in dset and "yolk" not in qwords: b -= 14
     for key, prefer in CANONICAL_BOOST.items():
-        if key in qwords and any(p in desc.lower() for p in prefer):
-            b += 55
+        if key in qwords and any(p in dset for p in prefer):
+            b += 40
     return b
 
 def text_score(terms, desc):
-    opts = [terms] + ([terms[:-1]] if terms.endswith("s") else [])
-    return max(raw_score(o, desc) for o in opts) + adjust(terms, desc)
+    return raw_score(terms, desc) + adjust(terms, desc)
 
 def mod_words(mod):
     return {w.rstrip("s") for w in re.split(r"[\s,]+", (mod or "").lower().strip()) if w}
