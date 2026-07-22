@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import sqlite3, re
 
 DB_FILE = "kcaldata.db"
-app = FastAPI(title="kcaldata API", version="0.5.0")
+app = FastAPI(title="kcaldata API", version="0.6.0")
 
 WEIGHT_UNITS = {
     "g": 1, "gram": 1, "grams": 1, "kg": 1000, "kilogram": 1000, "kilograms": 1000,
@@ -16,12 +16,17 @@ PORTION_UNITS = {
     "cup", "slice", "clove", "piece", "stick", "fillet", "serving", "can",
     "tbsp", "tablespoon", "tsp", "teaspoon", "bottle", "bar", "patty", "link",
 }
-# Processed/qualified forms that shouldn't win over the plain food:
-FORM_PENALTY = {"dried", "dehydrated", "powder", "powdered", "mix", "imitation",
-                "substitute", "concentrate", "breaded", "frozen", "nuggets",
-                "microwaved", "heated", "smoked", "canned", "prepared"}
-# Seed of your CURATED preferred-foods list. For a given food word, prefer rows
-# containing these tokens. Extend this over time as you find bad matches.
+# Processing/product words. Penalized only when the user did NOT ask for them.
+PROCESSED = {
+    "dried", "dehydrated", "powder", "powdered", "mix", "imitation", "substitute",
+    "concentrate", "breaded", "frozen", "nuggets", "microwaved", "heated", "smoked",
+    "canned", "prepared", "juice", "drink", "beverage", "flavored", "flavor",
+    "snacks", "snack", "bread", "cake", "pie", "candy", "cereal", "bar", "bars",
+    "sauce", "soup", "yogurt", "yoghurt", "chips", "pudding", "spread", "syrup",
+    "baby", "infant", "dressing", "gravy", "filling",
+}
+CAPS_IGNORE = {"USDA", "FDA", "II", "III"}
+# Curated truths for foods USDA files under a category (strong nudge):
 CANONICAL_BOOST = {
     "bacon": ["pork", "cured"],
     "milk": ["whole"],
@@ -30,6 +35,10 @@ CANONICAL_BOOST = {
 
 def fmt(n):
     return int(n) if float(n).is_integer() else round(n, 2)
+
+def norm(w):
+    w = w.lower()
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
 
 def raw_score(term, desc):
     q = term.lower().strip(); d = desc.lower(); s = 0.0
@@ -41,13 +50,27 @@ def raw_score(term, desc):
     return s
 
 def adjust(terms, desc):
-    words = set(re.findall(r"[a-z]+", desc.lower()))
-    b = -8 * len(words & FORM_PENALTY)   # push down processed forms
-    if "yolk" in words: b -= 12          # egg part, not the default egg
-    if "whole" in words: b += 6          # 'whole' is usually the canonical form
+    qwords = {norm(w) for w in re.findall(r"[a-z]+", terms.lower())}
+    orig = re.findall(r"[A-Za-z]+", desc)
+    dwords = [t.lower() for t in orig]
+    dnorm = {norm(w) for w in dwords}
+    b = 0.0
+    # Leading ALL-CAPS token usually means a brand (e.g., "SILK"): push down.
+    if orig and orig[0].isupper() and len(orig[0]) >= 2 and orig[0] not in CAPS_IGNORE:
+        b -= 40
+    # Head-noun: the queried food is the 1st (best) or 2nd word of the name.
+    if dwords:
+        if norm(dwords[0]) in qwords: b += 45
+        elif len(dwords) > 1 and norm(dwords[1]) in qwords: b += 30
+    if "raw" in dwords: b += 12
+    # Penalize processing/product words the user did NOT ask for.
+    b -= 16 * len({w for w in dnorm if w in PROCESSED} - qwords)
+    if "egg" in qwords:
+        if "whole" in dnorm: b += 6
+        if "yolk" in dnorm and "yolk" not in qwords: b -= 12
     for key, prefer in CANONICAL_BOOST.items():
-        if key in terms and any(p in desc.lower() for p in prefer):
-            b += 25
+        if key in qwords and any(p in desc.lower() for p in prefer):
+            b += 55
     return b
 
 def text_score(terms, desc):
@@ -188,7 +211,7 @@ def do_lookup(query):
 
 @app.get("/")
 def home():
-    return {"name": "kcaldata API", "try": "/v1/lookup?query=2 large eggs", "docs": "/docs"}
+    return {"name": "kcaldata API", "try": "/v1/lookup?query=banana", "docs": "/docs"}
 
 @app.get("/v1/lookup")
 def lookup(query: str):
