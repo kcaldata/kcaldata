@@ -1,10 +1,10 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from fastmcp import FastMCP
 import sqlite3, re
 
 DB_FILE = "kcaldata.db"
-app = FastAPI(title="kcaldata API", version="0.7.0")
 
 WEIGHT_UNITS = {
     "g": 1, "gram": 1, "grams": 1, "kg": 1000, "kilogram": 1000, "kilograms": 1000,
@@ -16,7 +16,6 @@ PORTION_UNITS = {
     "cup", "slice", "clove", "piece", "stick", "fillet", "serving", "can",
     "tbsp", "tablespoon", "tsp", "teaspoon", "bottle", "bar", "patty", "link",
 }
-# Processing / product words, stored SINGULAR. Penalized only if NOT requested.
 PROCESSED = {
     "dried", "dehydrated", "powder", "powdered", "mix", "imitation", "substitute",
     "concentrate", "breaded", "frozen", "nugget", "microwaved", "heated", "smoked",
@@ -26,10 +25,8 @@ PROCESSED = {
     "infant", "dressing", "gravy", "filling", "strudel", "croissant", "strained",
 }
 CANONICAL_BOOST = {
-    "bacon": ["pork", "cured"],
-    "milk": ["whole"],
-    "chicken": ["broiler", "meat only"],
-    "salmon": ["fish"],
+    "bacon": ["pork", "cured"], "milk": ["whole"],
+    "chicken": ["broiler", "meat only"], "salmon": ["fish"],
 }
 
 def fmt(n):
@@ -201,9 +198,30 @@ def do_lookup(query):
     ]
     con.close(); return result
 
+# ---------- MCP server (Streamable HTTP), shares do_lookup ----------
+mcp = FastMCP("kcaldata")
+
+@mcp.tool
+def lookup_calories(query: str) -> dict:
+    """Look up calorie information for a food or meal.
+
+    Accepts natural-language descriptions including quantity and unit,
+    e.g. "2 large eggs", "8 oz salmon", "1 cup rice", "3 slices bacon",
+    or a plain food name like "banana". Returns the matched food, its
+    calories, the total for the amount given, and how it was calculated.
+    """
+    r = do_lookup(query)
+    return r if r is not None else {"error": f"No match for '{query}'"}
+
+mcp_app = mcp.http_app(path="/mcp", allowed_hosts=["*"], allowed_origins=["*"])
+
+# ---------- REST API, sharing the MCP app's lifespan ----------
+app = FastAPI(title="kcaldata API", version="0.8.0", lifespan=mcp_app.lifespan)
+
 @app.get("/")
 def home():
-    return {"name": "kcaldata API", "try": "/v1/lookup?query=banana", "docs": "/docs"}
+    return {"name": "kcaldata API", "rest": "/v1/lookup?query=banana",
+            "mcp": "/mcp-server/mcp", "docs": "/docs"}
 
 @app.get("/v1/lookup")
 def lookup(query: str):
@@ -217,3 +235,5 @@ class Query(BaseModel):
 def lookup_post(body: Query):
     r = do_lookup(body.query)
     return r if r else JSONResponse(status_code=404, content={"error": f"No match for '{body.query}'"})
+
+app.mount("/mcp-server", mcp_app)
