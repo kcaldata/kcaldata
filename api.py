@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import sqlite3, re
 
 DB_FILE = "kcaldata.db"
-app = FastAPI(title="kcaldata API", version="0.4.0")
+app = FastAPI(title="kcaldata API", version="0.5.0")
 
 WEIGHT_UNITS = {
     "g": 1, "gram": 1, "grams": 1, "kg": 1000, "kilogram": 1000, "kilograms": 1000,
@@ -16,8 +16,17 @@ PORTION_UNITS = {
     "cup", "slice", "clove", "piece", "stick", "fillet", "serving", "can",
     "tbsp", "tablespoon", "tsp", "teaspoon", "bottle", "bar", "patty", "link",
 }
-FORM_PENALTY = {"dried", "dehydrated", "powder", "powdered", "mix",
-                "imitation", "substitute", "concentrate"}
+# Processed/qualified forms that shouldn't win over the plain food:
+FORM_PENALTY = {"dried", "dehydrated", "powder", "powdered", "mix", "imitation",
+                "substitute", "concentrate", "breaded", "frozen", "nuggets",
+                "microwaved", "heated", "smoked", "canned", "prepared"}
+# Seed of your CURATED preferred-foods list. For a given food word, prefer rows
+# containing these tokens. Extend this over time as you find bad matches.
+CANONICAL_BOOST = {
+    "bacon": ["pork", "cured"],
+    "milk": ["whole"],
+    "chicken": ["broiler", "meat only"],
+}
 
 def fmt(n):
     return int(n) if float(n).is_integer() else round(n, 2)
@@ -31,13 +40,19 @@ def raw_score(term, desc):
     s -= len(d) * 0.15
     return s
 
-def form_penalty(desc):
+def adjust(terms, desc):
     words = set(re.findall(r"[a-z]+", desc.lower()))
-    return 8 * len(words & FORM_PENALTY)
+    b = -8 * len(words & FORM_PENALTY)   # push down processed forms
+    if "yolk" in words: b -= 12          # egg part, not the default egg
+    if "whole" in words: b += 6          # 'whole' is usually the canonical form
+    for key, prefer in CANONICAL_BOOST.items():
+        if key in terms and any(p in desc.lower() for p in prefer):
+            b += 25
+    return b
 
 def text_score(terms, desc):
     opts = [terms] + ([terms[:-1]] if terms.endswith("s") else [])
-    return max(raw_score(o, desc) for o in opts) - form_penalty(desc)
+    return max(raw_score(o, desc) for o in opts) + adjust(terms, desc)
 
 def mod_words(mod):
     return {w.rstrip("s") for w in re.split(r"[\s,]+", (mod or "").lower().strip()) if w}
