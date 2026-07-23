@@ -12,7 +12,7 @@ from cdp.auth.utils.http import get_auth_headers, GetAuthHeadersOptions
 # ---------------- settings ----------------
 PAY_TO = "0xC58F8Eff2B6f46b9f5e75432FCdeBD5Dd949B09F"   # your Base wallet
 NETWORK = "eip155:8453"                                  # Base MAINNET (real USDC)
-PRICE = "$0.001"
+PRICE = "$0.005"
 KCALDATA_API = "https://api.kcaldata.com/v1/lookup"
 
 CDP_HOST = "api.cdp.coinbase.com"
