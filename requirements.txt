@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 fastmcp
-x402[evm]
 httpx
+x402[evm]
 cdp-sdk
